@@ -1,0 +1,314 @@
+"""MiniMax-H3 ノード群（V3）。モードではなく「繋いだ参照の組み合わせ」でプロンプトを自動構成する。
+
+  [Character/Male/Stage/Costume/Anchor/Motion/Audio Ref] ─H3_REF→ [Ref Bundle] ─H3_BUNDLE→ [Ref Prompt Generator]
+                                                              └→ picture_1..9 / video_1..3 / audio_1..3 → 本家 Ref2V ノードへ
+"""
+from comfy_api.latest import io
+
+try:
+    from . import refstore as store
+    from .common import SUBJECT_TYPES, MAX_SHOTS, DEFAULT_DURATION, MIN_DURATION, MAX_SHOT_DURATION
+    from .refs import (Ref, bundle_refs, describe, generate_from_bundle, AUDIO_ROLES,
+                       MAX_IMAGES, MAX_VIDEOS, MAX_AUDIOS)
+except ImportError:
+    import refstore as store
+    from common import SUBJECT_TYPES, MAX_SHOTS, DEFAULT_DURATION, MIN_DURATION, MAX_SHOT_DURATION
+    from refs import (Ref, bundle_refs, describe, generate_from_bundle, AUDIO_ROLES,
+                      MAX_IMAGES, MAX_VIDEOS, MAX_AUDIOS)
+
+H3_REF = io.Custom("H3_REF")
+H3_BUNDLE = io.Custom("H3_BUNDLE")
+CATEGORY = "MiniMaxH3/ref"
+MAX_REF_PINS = 8
+RETENTIONS = ["partially_preserved", "fully_preserved"]
+
+
+# ---------------------------------------------------------------- helpers
+def _preset_input(cat):
+    opts = store.list_presets(cat)
+    return io.Combo.Input("preset", options=opts, default=opts[0],
+                          tooltip=f"refs/{cat}/ 内のプリセット（追加後は ComfyUI の再起動で一覧に反映）")
+
+
+def _image_override():
+    return io.Image.Input("image", optional=True,
+                          tooltip="接続した場合はプリセット画像の代わりにこの画像を使用")
+
+
+def _shot_flags(suffix, tooltip):
+    return [io.Boolean.Input(f"shot{i}_{suffix}", default=True, tooltip=tooltip) for i in range(1, MAX_SHOTS + 1)]
+
+
+def _pick_shots(kw, suffix):
+    sel = [i for i in range(1, MAX_SHOTS + 1) if kw.get(f"shot{i}_{suffix}", True)]
+    return [] if len(sel) in (0, MAX_SHOTS) else sel  # 空 = 全Shot
+
+
+def _images(image, data):
+    if image is not None:
+        return [image[i:i + 1] for i in range(image.shape[0])]
+    return data["images"]
+
+
+def _join(*parts):
+    return " ".join(p.strip() for p in parts if p and p.strip())
+
+
+def _shot_inputs():
+    items = []
+    for i in range(1, MAX_SHOTS + 1):
+        items += [
+            io.Boolean.Input(f"shot{i}_enable", default=(i == 1)),
+            io.String.Input(f"shot{i}_text", multiline=True, default="", placeholder=f"【Shot {i}】本文"),
+            io.Float.Input(f"shot{i}_duration", default=DEFAULT_DURATION,
+                           min=MIN_DURATION, max=MAX_SHOT_DURATION, step=0.5),
+            io.String.Input(f"shot{i}_dialogue", default="", placeholder=f"【Shot {i}】セリフ"),
+        ]
+    return items
+
+
+# ---------------------------------------------------------------- ref nodes
+class MinimaxH3CharacterRef(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="MinimaxH3CharacterRef", display_name="MiniMax-H3 Character Ref", category=CATEGORY,
+            description="キャラクターシート参照。<Subject 1> になる（最初の参照画像）",
+            inputs=[
+                _preset_input("characters"), _image_override(),
+                io.String.Input("extra", multiline=True, default="", placeholder="【キャラクターの補足】（ref.json の説明に追記）"),
+                io.Boolean.Input("include_clothing", default=True, tooltip="服装もキャラシートに合わせる（Costume Ref 接続時は無視）"),
+            ],
+            outputs=[H3_REF.Output("ref")],
+        )
+
+    @classmethod
+    def fingerprint_inputs(cls, **kw):
+        return store.fingerprint("characters", kw.get("preset"))
+
+    @classmethod
+    def execute(cls, preset, extra, include_clothing, image=None):
+        d = store.load_preset("characters", preset)
+        return io.NodeOutput(Ref("character", images=_images(image, d), name=d["name"],
+                                 desc=_join(d["desc"], extra), retention=d["retention"],
+                                 opts=dict(include_clothing=include_clothing)))
+
+
+class MinimaxH3MaleRef(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="MinimaxH3MaleRef", display_name="MiniMax-H3 Male Ref", category=CATEGORY,
+            description="男性の参照画像。登場Shotを指定可能。画像なし＝アンカー画像に写っている男性",
+            inputs=[
+                _preset_input("males"), _image_override(),
+                io.String.Input("role", default="", placeholder="【男性の役割】例: male POV hands"),
+                io.String.Input("retention_desc", default="", placeholder="【保持設定】（空なら自動）"),
+                io.String.Input("extra", multiline=True, default="", placeholder="【外見の補足】"),
+                *_shot_flags("appears", "このShotに登場"),
+            ],
+            outputs=[H3_REF.Output("ref")],
+        )
+
+    @classmethod
+    def fingerprint_inputs(cls, **kw):
+        return store.fingerprint("males", kw.get("preset"))
+
+    @classmethod
+    def execute(cls, preset, role, retention_desc, extra, image=None, **kw):
+        d = store.load_preset("males", preset)
+        return io.NodeOutput(Ref("male", images=_images(image, d), name=d["name"],
+                                 role=role.strip() or d["role"], desc=_join(d["desc"], extra),
+                                 retention=retention_desc.strip() or d["retention"], shots=_pick_shots(kw, "appears")))
+
+
+class MinimaxH3StageRef(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="MinimaxH3StageRef", display_name="MiniMax-H3 Stage Ref", category=CATEGORY,
+            description="背景・照明・空間の参照（人物は無視させる）",
+            inputs=[
+                _preset_input("stages"), _image_override(),
+                io.String.Input("extra", multiline=True, default="", placeholder="【ステージの補足】"),
+                io.Combo.Input("retention", options=RETENTIONS, default="partially_preserved"),
+                *_shot_flags("applies", "このShotで使用"),
+            ],
+            outputs=[H3_REF.Output("ref")],
+        )
+
+    @classmethod
+    def fingerprint_inputs(cls, **kw):
+        return store.fingerprint("stages", kw.get("preset"))
+
+    @classmethod
+    def execute(cls, preset, extra, retention, image=None, **kw):
+        d = store.load_preset("stages", preset)
+        return io.NodeOutput(Ref("stage", images=_images(image, d), name=d["name"],
+                                 desc=_join(d["desc"], extra), retention=retention,
+                                 shots=_pick_shots(kw, "applies")))
+
+
+class MinimaxH3CostumeRef(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="MinimaxH3CostumeRef", display_name="MiniMax-H3 Costume Ref", category=CATEGORY,
+            description="衣装の差し替え。対象は常に最初の参照画像（<Picture 1> / <Subject 1>）",
+            inputs=[
+                _preset_input("costumes"), _image_override(),
+                io.Combo.Input("parts", options=["whole outfit", "top", "bottom", "accessories"],
+                               default="whole outfit", tooltip="変更範囲（全体 / 上衣 / 下衣 / アクセサリ）"),
+                io.String.Input("extra", multiline=True, default="", placeholder="【衣装の補足】"),
+            ],
+            outputs=[H3_REF.Output("ref")],
+        )
+
+    @classmethod
+    def fingerprint_inputs(cls, **kw):
+        return store.fingerprint("costumes", kw.get("preset"))
+
+    @classmethod
+    def execute(cls, preset, parts, extra, image=None):
+        d = store.load_preset("costumes", preset)
+        return io.NodeOutput(Ref("costume", images=_images(image, d), name=d["name"],
+                                 desc=_join(d["desc"], extra), opts=dict(parts=parts)))
+
+
+class MinimaxH3AnchorRef(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="MinimaxH3AnchorRef", display_name="MiniMax-H3 Anchor Frame Ref", category=CATEGORY,
+            description="先頭 / 末尾フレーム画像。Character Ref が無い場合は <Subject 1> になる",
+            inputs=[
+                io.Image.Input("image"),
+                io.Combo.Input("anchor_type", options=["first", "last"], default="first"),
+                io.String.Input("extra", multiline=True, default="", placeholder="【人物の補足（任意）】"),
+            ],
+            outputs=[H3_REF.Output("ref")],
+        )
+
+    @classmethod
+    def execute(cls, image, anchor_type, extra):
+        return io.NodeOutput(Ref("anchor", images=[image[i:i + 1] for i in range(image.shape[0])],
+                                 desc=extra, opts=dict(anchor_type=anchor_type)))
+
+
+class MinimaxH3MotionRef(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="MinimaxH3MotionRef", display_name="MiniMax-H3 Motion Video Ref", category=CATEGORY,
+            description="動き・タイミング・カメラワークの参照動画",
+            inputs=[
+                io.Video.Input("video"),
+                io.String.Input("motion_video_desc", multiline=True, default="", placeholder="【参照動画の動き】"),
+                io.Boolean.Input("auto_append_video_ref", default=True, tooltip="各Shotに <Video N> への参照を自動付与"),
+            ],
+            outputs=[H3_REF.Output("ref")],
+        )
+
+    @classmethod
+    def execute(cls, video, motion_video_desc, auto_append_video_ref):
+        return io.NodeOutput(Ref("motion", videos=[video], desc=motion_video_desc,
+                                 opts=dict(auto_append_video_ref=auto_append_video_ref)))
+
+
+class MinimaxH3AudioRef(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="MinimaxH3AudioRef", display_name="MiniMax-H3 Audio Ref", category=CATEGORY,
+            description="音声参照。話者は常に最初の参照画像（<Subject 1>）。視覚アンカー（画像/動画）が必須",
+            inputs=[
+                io.Audio.Input("audio"),
+                io.Combo.Input("audio_role", options=AUDIO_ROLES, default="reference"),
+                io.Boolean.Input("lipsync", default=True, tooltip="<Subject 1> の口の動きを音声に同期させる"),
+                io.String.Input("extra", multiline=True, default="", placeholder="【音声の補足】"),
+                *_shot_flags("applies", "このShotで使用"),
+            ],
+            outputs=[H3_REF.Output("ref")],
+        )
+
+    @classmethod
+    def execute(cls, audio, audio_role, lipsync, extra, **kw):
+        return io.NodeOutput(Ref("audio", audios=[audio], desc=extra, shots=_pick_shots(kw, "applies"),
+                                 opts=dict(audio_role=audio_role, lipsync=lipsync)))
+
+
+# ---------------------------------------------------------------- bundle
+class MinimaxH3RefBundle(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="MinimaxH3RefBundle", display_name="MiniMax-H3 Ref Bundle", category=CATEGORY,
+            description="参照を kind 順に採番。picture/video/audio 出力を番号順に本家 Ref2V ノードへ接続する",
+            inputs=[H3_REF.Input(f"ref{i}", optional=True) for i in range(1, MAX_REF_PINS + 1)],
+            outputs=[
+                H3_BUNDLE.Output("bundle"),
+                io.String.Output("status", tooltip="採番結果・エラー・警告"),
+                *[io.Image.Output(f"picture_{i}") for i in range(1, MAX_IMAGES + 1)],
+                *[io.Video.Output(f"video_{i}") for i in range(1, MAX_VIDEOS + 1)],
+                *[io.Audio.Output(f"audio_{i}") for i in range(1, MAX_AUDIOS + 1)],
+            ],
+        )
+
+    @classmethod
+    def execute(cls, **kw):
+        b = bundle_refs([kw.get(f"ref{i}") for i in range(1, MAX_REF_PINS + 1)])
+        status = describe(b)
+        if b.errors:
+            status = "ERROR: " + " / ".join(b.errors) + " | " + status
+        elif b.warnings:
+            status = "WARN: " + " / ".join(b.warnings) + " | " + status
+        else:
+            status = "OK " + status
+
+        def pad(lst, n):
+            return (list(lst) + [None] * n)[:n]
+
+        return io.NodeOutput(b, status, *pad(b.pictures, MAX_IMAGES),
+                             *pad(b.videos, MAX_VIDEOS), *pad(b.audios, MAX_AUDIOS))
+
+
+# ---------------------------------------------------------------- prompt generator
+class MinimaxH3RefPromptGenerator(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="MinimaxH3RefPromptGenerator", display_name="MiniMax-H3 Prompt Generator",
+            category="MiniMaxH3",
+            description="Ref Bundle の内容からモード不要でプロンプトを自動生成",
+            inputs=[
+                H3_BUNDLE.Input("bundle"),
+                io.String.Input("summary_action", multiline=True, default="", placeholder="【動画全体の動き】"),
+                io.String.Input("camera_style", multiline=True, default="", placeholder="【カメラ・画作り】"),
+                io.String.Input("soundscape", multiline=True, default="", placeholder="【環境音・効果音】"),
+                io.Boolean.Input("enable_music", default=False),
+                io.String.Input("music_text", multiline=True, default="", placeholder="【BGM】"),
+                io.Combo.Input("subject_type", options=SUBJECT_TYPES, default="woman"),
+                io.Boolean.Input("auto_speech_cue", default=True, tooltip="セリフがあるShotに発話キューを自動付与"),
+                *_shot_inputs(),
+            ],
+            outputs=[
+                io.String.Output("prompt"),
+                io.String.Output("dialogue"),
+                io.String.Output("status"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, bundle, summary_action, camera_style, soundscape, enable_music, music_text,
+                subject_type, auto_speech_cue, **kw):
+        prompt, dialogue, status = generate_from_bundle(
+            bundle, summary_action, camera_style, soundscape, enable_music, music_text,
+            kw, auto_speech_cue=auto_speech_cue, subject_type=subject_type)
+        return io.NodeOutput(prompt, dialogue, status)
+
+
+NODES = [
+    MinimaxH3CharacterRef, MinimaxH3MaleRef, MinimaxH3StageRef, MinimaxH3CostumeRef,
+    MinimaxH3AnchorRef, MinimaxH3MotionRef, MinimaxH3AudioRef,
+    MinimaxH3RefBundle, MinimaxH3RefPromptGenerator,
+]

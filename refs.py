@@ -43,6 +43,7 @@ class Ref:
     videos: list = field(default_factory=list)
     audios: list = field(default_factory=list)
     name: str = ""
+    enabled: bool = True    # False の Ref は Bundle に接続されていても無視される
     desc: str = ""          # 補足説明（プロンプトに入る）
     retention: str = ""     # 保持設定（空なら kind 既定）
     role: str = ""          # male の役割
@@ -79,7 +80,7 @@ def _flatten(refs):
 
 # ------------------------------------------------------------------ numbering
 def bundle_refs(refs):
-    flat = _flatten(refs)
+    flat = [r for r in _flatten(refs) if getattr(r, "enabled", True)]
     b = Bundle()
     for r in flat:
         if r.kind not in ALL_KINDS:
@@ -274,11 +275,14 @@ def render_sections(b, names, shot_map, subject_type, action, texts):
     # ---- motion video
     for v in motions:
         t = _tags("Video", v.vids)
+        swap = has_s1 and v.opts.get("replace_appearance", True)
         defs.append(f"{t} is the motion reference video that provides the body movement, timing, camera "
-                    f"movement, and action rhythm to be followed by <Subject 1>.{_x(v.desc)}")
+                    f"movement, and action rhythm to be followed by <Subject 1>.{_x(v.desc)}"
+                    + (f" The face, hair, clothing, and body of any person in {t} are not used." if swap else ""))
         rets.append(f"{t} (motion, timing, and camera structure): partially_preserved - the body movements, "
-                    "action timing, and overall rhythm are followed as closely as possible, while the "
-                    "character appearance is replaced by <Subject 1>.")
+                    "action timing, and overall rhythm are followed as closely as possible, while "
+                    + ("the original person's appearance is completely discarded from the very first frame and "
+                       "replaced by <Subject 1>." if swap else "the character appearance is replaced by <Subject 1>."))
 
     # ---- audio（話者は常に <Subject 1>）
     for a in audios:
@@ -324,6 +328,10 @@ def render_sections(b, names, shot_map, subject_type, action, texts):
         extra.append(f"The environment, lighting, and layout follow {', '.join(_tags('Picture', s.pics) for s in stages)}.")
     if motions:
         extra.append(f"The movements, timing, and camera work are guided by {', '.join(_tags('Video', v.vids) for v in motions)}.")
+    if motions and has_s1 and any(v.opts.get("replace_appearance", True) for v in motions):
+        extra.append("From the very first frame, <Subject 1> replaces the person in "
+                     f"{', '.join(_tags('Video', v.vids) for v in motions)}; the original person's appearance "
+                     "never appears in the target video.")
     if audios:
         extra.append(f"The voice of <Subject 1> follows {', '.join(_tags('Audio', a.auds) for a in audios)}.")
     summary = " ".join([tag, body] + extra).strip()
@@ -352,7 +360,11 @@ def generate_from_bundle(b, summary_action, camera_style, soundscape, enable_mus
     suffix = skip = None
     if motions and motions[0].opts.get("auto_append_video_ref", True):
         skip = _tags("Video", motions[0].vids[:1])
-        suffix = f"(following the motion and timing of {skip})"
+        if motions[0].opts.get("replace_appearance", True):
+            suffix = (f"(following only the motion and timing of {skip}; the appearance is that of "
+                      "<Subject 1> from the first frame)")
+        else:
+            suffix = f"(following the motion and timing of {skip})"
     formatted, names, fdlg, total, warns = collect_from_kwargs(
         shot_kwargs, auto_speech_cue, append_suffix=suffix, skip_if_contains=skip)
     dialogue = dialogue_lines_only(fdlg)
@@ -368,6 +380,7 @@ def generate_from_bundle(b, summary_action, camera_style, soundscape, enable_mus
         else:
             fb = "[Shot 1] <Subject 1> appears in the scene."
             if motions:
+                fb = "[Shot 1] <Subject 1> appears in the scene from the first frame."
                 fb += f" The movement follows {_tags('Video', motions[0].vids[:1])}."
         formatted, names = [fb], ["[Shot 1]"]
         shot_map = {i: 1 for i in range(1, MAX_SHOTS + 1)}
@@ -399,3 +412,16 @@ non_diegetic_music: {resolve_music(enable_music, music_text)}"""
     head = f"[refs] {describe(b)} | total {total:.1f}s"
     status = f"OK {head}" if not warns else f"WARN {head} | " + " / ".join(warns)
     return clean_prompt(prompt), dialogue, status
+
+
+# ------------------------------------------------------------------ size helper
+SIZE_STEP = 32
+
+
+def fit_size(w, h, megapixels, step=SIZE_STEP):
+    """アスペクト比を保ち、面積が megapixels に近い step の倍数サイズを返す。0 以下ならリサイズなし。"""
+    if megapixels <= 0 or w <= 0 or h <= 0:
+        return w, h
+    scale = (megapixels * 1_000_000 / (w * h)) ** 0.5
+    snap = lambda v: max(step, int(round(v * scale / step)) * step)  # noqa: E731
+    return snap(w), snap(h)

@@ -9,12 +9,12 @@ try:
     from . import refstore as store
     from .common import SUBJECT_TYPES, MAX_SHOTS, DEFAULT_DURATION, MIN_DURATION, MAX_SHOT_DURATION
     from .refs import (Ref, bundle_refs, describe, generate_from_bundle, AUDIO_ROLES,
-                       MAX_IMAGES, MAX_VIDEOS, MAX_AUDIOS)
+                       MAX_IMAGES, MAX_VIDEOS, MAX_AUDIOS, SIZE_STEP, fit_size)
 except ImportError:
     import refstore as store
     from common import SUBJECT_TYPES, MAX_SHOTS, DEFAULT_DURATION, MIN_DURATION, MAX_SHOT_DURATION
     from refs import (Ref, bundle_refs, describe, generate_from_bundle, AUDIO_ROLES,
-                      MAX_IMAGES, MAX_VIDEOS, MAX_AUDIOS)
+                      MAX_IMAGES, MAX_VIDEOS, MAX_AUDIOS, SIZE_STEP, fit_size)
 
 H3_REF = io.Custom("H3_REF")
 H3_BUNDLE = io.Custom("H3_BUNDLE")
@@ -68,6 +68,23 @@ def _shot_inputs():
 
 
 # ---------------------------------------------------------------- ref nodes
+# 全 Ref ノード共通: enable(ON/OFF) 入力と、ref / enabled(Boolean) 出力。
+# OFF の Ref は Bundle に接続されていても無視される（ピンの付け替え不要）。
+def _enable():
+    return io.Boolean.Input("enable", default=True,
+                            tooltip="OFF にすると Ref Bundle に接続されていても無視される")
+
+
+def _outs(*extra):
+    return [H3_REF.Output("ref"),
+            io.Boolean.Output("enabled", tooltip="この参照が有効か（他ノードのスイッチ用）"),
+            *extra]
+
+
+def _off(kind, *extra):
+    return io.NodeOutput(Ref(kind, enabled=False), False, *extra)
+
+
 class MinimaxH3CharacterRef(io.ComfyNode):
     @classmethod
     def define_schema(cls):
@@ -75,11 +92,11 @@ class MinimaxH3CharacterRef(io.ComfyNode):
             node_id="MinimaxH3CharacterRef", display_name="MiniMax-H3 Character Ref", category=CATEGORY,
             description="キャラクターシート参照。<Subject 1> になる（最初の参照画像）",
             inputs=[
-                _preset_input("characters"), _image_override(),
+                _enable(), _preset_input("characters"), _image_override(),
                 io.String.Input("extra", multiline=True, default="", placeholder="【キャラクターの補足】（ref.json の説明に追記）"),
                 io.Boolean.Input("include_clothing", default=True, tooltip="服装もキャラシートに合わせる（Costume Ref 接続時は無視）"),
             ],
-            outputs=[H3_REF.Output("ref")],
+            outputs=_outs(),
         )
 
     @classmethod
@@ -87,11 +104,13 @@ class MinimaxH3CharacterRef(io.ComfyNode):
         return store.fingerprint("characters", kw.get("preset"))
 
     @classmethod
-    def execute(cls, preset, extra, include_clothing, image=None):
+    def execute(cls, enable, preset, extra, include_clothing, image=None):
+        if not enable:
+            return _off("character")
         d = store.load_preset("characters", preset)
         return io.NodeOutput(Ref("character", images=_images(image, d), name=d["name"],
                                  desc=_join(d["desc"], extra), retention=d["retention"],
-                                 opts=dict(include_clothing=include_clothing)))
+                                 opts=dict(include_clothing=include_clothing)), True)
 
 
 class MinimaxH3MaleRef(io.ComfyNode):
@@ -101,13 +120,13 @@ class MinimaxH3MaleRef(io.ComfyNode):
             node_id="MinimaxH3MaleRef", display_name="MiniMax-H3 Male Ref", category=CATEGORY,
             description="男性の参照画像。登場Shotを指定可能。画像なし＝アンカー画像に写っている男性",
             inputs=[
-                _preset_input("males"), _image_override(),
+                _enable(), _preset_input("males"), _image_override(),
                 io.String.Input("role", default="", placeholder="【男性の役割】例: male POV hands"),
                 io.String.Input("retention_desc", default="", placeholder="【保持設定】（空なら自動）"),
                 io.String.Input("extra", multiline=True, default="", placeholder="【外見の補足】"),
                 *_shot_flags("appears", "このShotに登場"),
             ],
-            outputs=[H3_REF.Output("ref")],
+            outputs=_outs(),
         )
 
     @classmethod
@@ -115,11 +134,14 @@ class MinimaxH3MaleRef(io.ComfyNode):
         return store.fingerprint("males", kw.get("preset"))
 
     @classmethod
-    def execute(cls, preset, role, retention_desc, extra, image=None, **kw):
+    def execute(cls, enable, preset, role, retention_desc, extra, image=None, **kw):
+        if not enable:
+            return _off("male")
         d = store.load_preset("males", preset)
         return io.NodeOutput(Ref("male", images=_images(image, d), name=d["name"],
                                  role=role.strip() or d["role"], desc=_join(d["desc"], extra),
-                                 retention=retention_desc.strip() or d["retention"], shots=_pick_shots(kw, "appears")))
+                                 retention=retention_desc.strip() or d["retention"],
+                                 shots=_pick_shots(kw, "appears")), True)
 
 
 class MinimaxH3StageRef(io.ComfyNode):
@@ -129,12 +151,12 @@ class MinimaxH3StageRef(io.ComfyNode):
             node_id="MinimaxH3StageRef", display_name="MiniMax-H3 Stage Ref", category=CATEGORY,
             description="背景・照明・空間の参照（人物は無視させる）",
             inputs=[
-                _preset_input("stages"), _image_override(),
+                _enable(), _preset_input("stages"), _image_override(),
                 io.String.Input("extra", multiline=True, default="", placeholder="【ステージの補足】"),
                 io.Combo.Input("retention", options=RETENTIONS, default="partially_preserved"),
                 *_shot_flags("applies", "このShotで使用"),
             ],
-            outputs=[H3_REF.Output("ref")],
+            outputs=_outs(),
         )
 
     @classmethod
@@ -142,11 +164,13 @@ class MinimaxH3StageRef(io.ComfyNode):
         return store.fingerprint("stages", kw.get("preset"))
 
     @classmethod
-    def execute(cls, preset, extra, retention, image=None, **kw):
+    def execute(cls, enable, preset, extra, retention, image=None, **kw):
+        if not enable:
+            return _off("stage")
         d = store.load_preset("stages", preset)
         return io.NodeOutput(Ref("stage", images=_images(image, d), name=d["name"],
                                  desc=_join(d["desc"], extra), retention=retention,
-                                 shots=_pick_shots(kw, "applies")))
+                                 shots=_pick_shots(kw, "applies")), True)
 
 
 class MinimaxH3CostumeRef(io.ComfyNode):
@@ -156,12 +180,12 @@ class MinimaxH3CostumeRef(io.ComfyNode):
             node_id="MinimaxH3CostumeRef", display_name="MiniMax-H3 Costume Ref", category=CATEGORY,
             description="衣装の差し替え。対象は常に最初の参照画像（<Picture 1> / <Subject 1>）",
             inputs=[
-                _preset_input("costumes"), _image_override(),
+                _enable(), _preset_input("costumes"), _image_override(),
                 io.Combo.Input("parts", options=["whole outfit", "top", "bottom", "accessories"],
                                default="whole outfit", tooltip="変更範囲（全体 / 上衣 / 下衣 / アクセサリ）"),
                 io.String.Input("extra", multiline=True, default="", placeholder="【衣装の補足】"),
             ],
-            outputs=[H3_REF.Output("ref")],
+            outputs=_outs(),
         )
 
     @classmethod
@@ -169,10 +193,21 @@ class MinimaxH3CostumeRef(io.ComfyNode):
         return store.fingerprint("costumes", kw.get("preset"))
 
     @classmethod
-    def execute(cls, preset, parts, extra, image=None):
+    def execute(cls, enable, preset, parts, extra, image=None):
+        if not enable:
+            return _off("costume")
         d = store.load_preset("costumes", preset)
         return io.NodeOutput(Ref("costume", images=_images(image, d), name=d["name"],
-                                 desc=_join(d["desc"], extra), opts=dict(parts=parts)))
+                                 desc=_join(d["desc"], extra), opts=dict(parts=parts)), True)
+
+
+def _resize_nearest(image, w, h):
+    """[B,H,W,C] を nearest-exact で (h, w) にリサイズ。"""
+    import torch.nn.functional as F
+    if image.shape[1] == h and image.shape[2] == w:
+        return image
+    x = F.interpolate(image.movedim(-1, 1), size=(h, w), mode="nearest-exact")
+    return x.movedim(1, -1)
 
 
 class MinimaxH3AnchorRef(io.ComfyNode):
@@ -180,19 +215,43 @@ class MinimaxH3AnchorRef(io.ComfyNode):
     def define_schema(cls):
         return io.Schema(
             node_id="MinimaxH3AnchorRef", display_name="MiniMax-H3 Anchor Frame Ref", category=CATEGORY,
-            description="先頭 / 末尾フレーム画像。Character Ref が無い場合は <Subject 1> になる",
+            description="先頭 / 末尾フレーム画像。Character Ref が無い場合は <Subject 1> になる。"
+                        "メガピクセル指定で 32 の倍数にリサイズし、幅・高さを出力する",
             inputs=[
-                io.Image.Input("image"),
+                _enable(),
+                io.Image.Input("image", optional=True),
                 io.Combo.Input("anchor_type", options=["first", "last"], default="first"),
+                io.Float.Input("megapixels", default=1.0, min=0.0, max=8.0, step=0.05,
+                               tooltip=f"目標メガピクセル。アスペクト比維持・{SIZE_STEP} の倍数・nearest-exact。0 でリサイズなし"),
                 io.String.Input("extra", multiline=True, default="", placeholder="【人物の補足（任意）】"),
             ],
-            outputs=[H3_REF.Output("ref")],
+            outputs=_outs(io.Image.Output("image"), io.Int.Output("width"), io.Int.Output("height")),
         )
 
     @classmethod
-    def execute(cls, image, anchor_type, extra):
-        return io.NodeOutput(Ref("anchor", images=[image[i:i + 1] for i in range(image.shape[0])],
-                                 desc=extra, opts=dict(anchor_type=anchor_type)))
+    def execute(cls, enable, anchor_type, megapixels, extra, image=None):
+        if image is None:
+            return io.NodeOutput(Ref("anchor", enabled=enable, opts=dict(anchor_type=anchor_type)), enable, None, 0, 0)
+        w, h = fit_size(int(image.shape[2]), int(image.shape[1]), megapixels)
+        if not enable:  # OFF でもサイズは出力する（動画サイズの入力に使えるように）
+            return io.NodeOutput(Ref("anchor", enabled=False), False, image, w, h)
+        image = _resize_nearest(image, w, h)
+        ref = Ref("anchor", images=[image[i:i + 1] for i in range(image.shape[0])],
+                  desc=extra, opts=dict(anchor_type=anchor_type))
+        return io.NodeOutput(ref, True, image, w, h)
+
+
+def _images_to_video(images, fps):
+    """IMAGE フレーム列 → VIDEO（本家 Ref2V ノードは VIDEO を受けるため）。"""
+    from fractions import Fraction
+    rate = Fraction(float(fps)).limit_denominator(1000)
+    try:
+        from comfy_api.latest import InputImpl, Types
+        return InputImpl.VideoFromComponents(Types.VideoComponents(images=images, audio=None, frame_rate=rate))
+    except (ImportError, AttributeError):
+        from comfy_api.input_impl import VideoFromComponents
+        from comfy_api.util import VideoComponents
+        return VideoFromComponents(VideoComponents(images=images, audio=None, frame_rate=rate))
 
 
 class MinimaxH3MotionRef(io.ComfyNode):
@@ -200,19 +259,30 @@ class MinimaxH3MotionRef(io.ComfyNode):
     def define_schema(cls):
         return io.Schema(
             node_id="MinimaxH3MotionRef", display_name="MiniMax-H3 Motion Video Ref", category=CATEGORY,
-            description="動き・タイミング・カメラワークの参照動画",
+            description="動き・タイミング・カメラワークの参照。VIDEO か IMAGE（フレーム列）のどちらでも接続可",
             inputs=[
-                io.Video.Input("video"),
+                _enable(),
+                io.Video.Input("video", optional=True),
+                io.Image.Input("images", optional=True, tooltip="フレーム列。video が未接続のときに使用し VIDEO に変換する"),
+                io.Float.Input("fps", default=24.0, min=1.0, max=120.0, step=0.5, tooltip="images 入力時のフレームレート"),
                 io.String.Input("motion_video_desc", multiline=True, default="", placeholder="【参照動画の動き】"),
                 io.Boolean.Input("auto_append_video_ref", default=True, tooltip="各Shotに <Video N> への参照を自動付与"),
+                io.Boolean.Input("replace_appearance", default=True,
+                                 tooltip="参照動画の人物の外見を最初のフレームから <Subject 1> に置き換えるよう明記する"),
             ],
-            outputs=[H3_REF.Output("ref")],
+            outputs=_outs(),
         )
 
     @classmethod
-    def execute(cls, video, motion_video_desc, auto_append_video_ref):
-        return io.NodeOutput(Ref("motion", videos=[video], desc=motion_video_desc,
-                                 opts=dict(auto_append_video_ref=auto_append_video_ref)))
+    def execute(cls, enable, fps, motion_video_desc, auto_append_video_ref, replace_appearance,
+                video=None, images=None):
+        if not enable:
+            return _off("motion")
+        if video is None and images is not None:
+            video = _images_to_video(images, fps)
+        return io.NodeOutput(Ref("motion", videos=[video] if video is not None else [], desc=motion_video_desc,
+                                 opts=dict(auto_append_video_ref=auto_append_video_ref,
+                                           replace_appearance=replace_appearance)), True)
 
 
 class MinimaxH3AudioRef(io.ComfyNode):
@@ -222,19 +292,23 @@ class MinimaxH3AudioRef(io.ComfyNode):
             node_id="MinimaxH3AudioRef", display_name="MiniMax-H3 Audio Ref", category=CATEGORY,
             description="音声参照。話者は常に最初の参照画像（<Subject 1>）。視覚アンカー（画像/動画）が必須",
             inputs=[
-                io.Audio.Input("audio"),
+                _enable(),
+                io.Audio.Input("audio", optional=True),
                 io.Combo.Input("audio_role", options=AUDIO_ROLES, default="reference"),
                 io.Boolean.Input("lipsync", default=True, tooltip="<Subject 1> の口の動きを音声に同期させる"),
                 io.String.Input("extra", multiline=True, default="", placeholder="【音声の補足】"),
                 *_shot_flags("applies", "このShotで使用"),
             ],
-            outputs=[H3_REF.Output("ref")],
+            outputs=_outs(),
         )
 
     @classmethod
-    def execute(cls, audio, audio_role, lipsync, extra, **kw):
-        return io.NodeOutput(Ref("audio", audios=[audio], desc=extra, shots=_pick_shots(kw, "applies"),
-                                 opts=dict(audio_role=audio_role, lipsync=lipsync)))
+    def execute(cls, enable, audio_role, lipsync, extra, audio=None, **kw):
+        if not enable:
+            return _off("audio")
+        return io.NodeOutput(Ref("audio", audios=[audio] if audio is not None else [], desc=extra,
+                                 shots=_pick_shots(kw, "applies"),
+                                 opts=dict(audio_role=audio_role, lipsync=lipsync)), True)
 
 
 # ---------------------------------------------------------------- bundle

@@ -13,6 +13,17 @@ subject_definitions / summary / retention_analysis が組み立てられます�
             └ picture_1..9 / video_1..3 / audio_1..3 → 本家 Ref2V ノードへ（番号順に接続）
     Dialogue Merger（prompt + dialogue を結合）
 
+## 全 Ref ノード共通
+
+- `enable` スイッチ: OFF にすると Ref Bundle に接続されていても無視されます（ピンの付け替え不要）。
+- `enabled` 出力（Boolean）: 他ノードのスイッチ連動用。
+
+## ノード別のポイント
+
+- **Anchor Frame Ref**: `megapixels` 指定で、アスペクト比を保ち 32 の倍数・nearest-exact にリサイズ。`image` / `width` / `height` を出力（0 でリサイズなし。OFF でもサイズは出力）。
+- **Motion Video Ref**: `video`（VIDEO）か `images`（フレーム列 + `fps`）のどちらでも接続可。`replace_appearance`（既定 ON）で、参照動画の人物の外見を最初のフレームから `<Subject 1>` に置き換えるよう明記します。
+- **Audio / Anchor / Motion**: メディア入力は任意。未接続のまま `enable` を OFF にできます（ON で未接続は Bundle が ERROR）。
+
 ## 採番ルール（接続順ではなく kind の優先順）
 
 | 対象 | 順序 |

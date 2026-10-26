@@ -10,8 +10,19 @@ subject_definitions / summary / retention_analysis が組み立てられます�
       Character Ref / Male Ref / Stage Ref / Costume Ref / Anchor Frame Ref / Motion Video Ref / Audio Ref
             ↓ ref1〜ref8
       Ref Bundle ── bundle ──→ Prompt Generator ──→ prompt / dialogue / status
-            └ picture_1..9 / video_1..3 / audio_1..3 → 本家 Ref2V ノードへ（番号順に接続）
+            └ 種類ごとの固定ピン → 本家 Ref2V ノードへ（上から順に接続）
     Dialogue Merger（prompt + dialogue を結合）
+
+## Ref Bundle の出力ピン（種類ごとに固定）
+
+    画像:  character_1, character_2, anchor, male_1, male_2, costume_1, costume_2, stage_1, stage_2
+    動画:  motion_1〜3（IMAGE＝24fps フレーム列。本家 ref_videos が IMAGE のため）
+    音声:  audio_1〜3
+
+- ピン名は Ref ノードの種類と一致します。他の参照を OFF にしても、各ピンの中身は動きません。
+- OFF の参照のピンは `None` を出力します。画像は上の並び順（= `<Picture N>` の採番順）で本家 Ref2V の `ref_images` に接続してください。
+- `status` に「ピン名→`<Picture N>`」の対応が出ます。
+- 1種類あたりの画像数は上のピン数まで（character 2 / male 2 / costume 2 / stage 2 / anchor 1）。超過は ERROR。
 
 ## 全 Ref ノード共通
 
@@ -21,7 +32,7 @@ subject_definitions / summary / retention_analysis が組み立てられます�
 ## ノード別のポイント
 
 - **Anchor Frame Ref**: `megapixels` 指定で、アスペクト比を保ち 32 の倍数・nearest-exact にリサイズ。`image` / `width` / `height` を出力（0 でリサイズなし。OFF でもサイズは出力）。
-- **Motion Video Ref**: `video`（VIDEO）か `images`（フレーム列 + `fps`）のどちらでも接続可。`replace_appearance`（既定 ON）で、参照動画の人物の外見を最初のフレームから `<Subject 1>` に置き換えるよう明記します。
+- **Motion Video Ref**: `images`（IMAGE フレーム列）を受けてそのまま出力。`video`（VIDEO）を繋いだ場合はフレーム列に変換。`replace_appearance`（既定 ON）で、参照動画の人物の外見を最初のフレームから `<Subject 1>` に置き換えるよう明記します。
 - **Audio / Anchor / Motion**: メディア入力は任意。未接続のまま `enable` を OFF にできます（ON で未接続は Bundle が ERROR）。
 
 ## 採番ルール（接続順ではなく kind の優先順）

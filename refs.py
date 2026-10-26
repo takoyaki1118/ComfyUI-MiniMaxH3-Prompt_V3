@@ -23,6 +23,23 @@ KIND_ORDER = ("character", "anchor", "male", "costume", "stage")
 ALL_KINDS = KIND_ORDER + ("motion", "audio")
 MAX_IMAGES, MAX_VIDEOS, MAX_AUDIOS = 9, 3, 3
 
+# Bundle の出力ピン。名前は Ref ノードの種類と一致させ、他の参照の ON/OFF で中身が動かない。
+# 画像の並びは採番順（character → anchor → male → costume → stage）と同じ。
+PIN_SLOTS = {"character": 2, "anchor": 1, "male": 2, "costume": 2, "stage": 2, "motion": 3, "audio": 3}
+
+
+def pin_name(kind, idx):
+    return kind if PIN_SLOTS[kind] == 1 else f"{kind}_{idx + 1}"
+
+
+def pin_layout():
+    """[(pin名, 'image'|'audio')]。motion は IMAGE（24fps フレーム列）。"""
+    out = [(pin_name(k, i), "image") for k in KIND_ORDER for i in range(PIN_SLOTS[k])]
+    out += [(pin_name("motion", i), "image") for i in range(PIN_SLOTS["motion"])]
+    out += [(pin_name("audio", i), "audio") for i in range(PIN_SLOTS["audio"])]
+    return out
+
+
 DEFAULT_MALE_ROLE = "male POV hands"
 DEFAULT_MALE_RETENTION = "partially_preserved - hands interacting naturally with <Subject 1>"
 
@@ -64,6 +81,9 @@ class Bundle:
     audios: list = field(default_factory=list)
     errors: list = field(default_factory=list)
     warnings: list = field(default_factory=list)
+    pin_media: dict = field(default_factory=dict)   # pin名 -> メディア
+    pin_label: dict = field(default_factory=dict)   # pin名 -> "<Picture N>" など
+    counts: dict = field(default_factory=dict)
 
     def of(self, kind):
         return [r for r in self.refs if r.kind == kind]
@@ -79,6 +99,17 @@ def _flatten(refs):
 
 
 # ------------------------------------------------------------------ numbering
+def _pin(b, kind, label, num, media):
+    idx = b.counts.get(kind, 0)
+    b.counts[kind] = idx + 1
+    if idx >= PIN_SLOTS[kind]:
+        b.errors.append(f"{kind}: 出力ピン数（{PIN_SLOTS[kind]}）を超えています")
+        return
+    name = pin_name(kind, idx)
+    b.pin_media[name] = media
+    b.pin_label[name] = f"<{label} {num}>"
+
+
 def bundle_refs(refs):
     flat = [r for r in _flatten(refs) if getattr(r, "enabled", True)]
     b = Bundle()
@@ -96,12 +127,15 @@ def bundle_refs(refs):
         for im in r.images:
             b.pictures.append(im)
             r.pics.append(len(b.pictures))
+            _pin(b, r.kind, "Picture", len(b.pictures), im)
         for v in r.videos:
             b.videos.append(v)
             r.vids.append(len(b.videos))
+            _pin(b, r.kind, "Video", len(b.videos), v)
         for a in r.audios:
             b.audios.append(a)
             r.auds.append(len(b.audios))
+            _pin(b, r.kind, "Audio", len(b.audios), a)
         if r.kind in ("character", "male") or (r.kind == "anchor" and not has_char):
             n_subj += 1
             r.subj = n_subj
@@ -137,17 +171,8 @@ def bundle_refs(refs):
 
 
 def describe(b):
-    parts = []
-    for r in b.refs:
-        label = r.kind
-        if r.kind == "anchor":
-            label = f"{r.opts.get('anchor_type', 'first')} frame"
-        if r.name:
-            label += f"({r.name})"
-        parts += [f"<Picture {p}>={label}" for p in r.pics]
-        parts += [f"<Video {p}>={label}" for p in r.vids]
-        parts += [f"<Audio {p}>={label}" for p in r.auds]
-    return ", ".join(parts) or "no refs"
+    """例: 'character_1→<Picture 1>, male_1→<Picture 2>, motion_1→<Video 1>'"""
+    return ", ".join(f"{p}→{l}" for p, l in b.pin_label.items()) or "no refs"
 
 
 # ------------------------------------------------------------------ rendering

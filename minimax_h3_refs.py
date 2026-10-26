@@ -9,12 +9,12 @@ try:
     from . import refstore as store
     from .common import SUBJECT_TYPES, MAX_SHOTS, DEFAULT_DURATION, MIN_DURATION, MAX_SHOT_DURATION
     from .refs import (Ref, bundle_refs, describe, generate_from_bundle, AUDIO_ROLES,
-                       MAX_IMAGES, MAX_VIDEOS, MAX_AUDIOS, SIZE_STEP, fit_size)
+                       pin_layout, SIZE_STEP, fit_size)
 except ImportError:
     import refstore as store
     from common import SUBJECT_TYPES, MAX_SHOTS, DEFAULT_DURATION, MIN_DURATION, MAX_SHOT_DURATION
     from refs import (Ref, bundle_refs, describe, generate_from_bundle, AUDIO_ROLES,
-                      MAX_IMAGES, MAX_VIDEOS, MAX_AUDIOS, SIZE_STEP, fit_size)
+                      pin_layout, SIZE_STEP, fit_size)
 
 H3_REF = io.Custom("H3_REF")
 H3_BUNDLE = io.Custom("H3_BUNDLE")
@@ -241,17 +241,9 @@ class MinimaxH3AnchorRef(io.ComfyNode):
         return io.NodeOutput(ref, True, image, w, h)
 
 
-def _images_to_video(images, fps):
-    """IMAGE フレーム列 → VIDEO（本家 Ref2V ノードは VIDEO を受けるため）。"""
-    from fractions import Fraction
-    rate = Fraction(float(fps)).limit_denominator(1000)
-    try:
-        from comfy_api.latest import InputImpl, Types
-        return InputImpl.VideoFromComponents(Types.VideoComponents(images=images, audio=None, frame_rate=rate))
-    except (ImportError, AttributeError):
-        from comfy_api.input_impl import VideoFromComponents
-        from comfy_api.util import VideoComponents
-        return VideoFromComponents(VideoComponents(images=images, audio=None, frame_rate=rate))
+def _frames_from_video(video):
+    """VIDEO → IMAGE フレーム列 [N,H,W,C]（本家 ref_videos は IMAGE 入力のため）。"""
+    return video.get_components().images
 
 
 class MinimaxH3MotionRef(io.ComfyNode):
@@ -259,12 +251,11 @@ class MinimaxH3MotionRef(io.ComfyNode):
     def define_schema(cls):
         return io.Schema(
             node_id="MinimaxH3MotionRef", display_name="MiniMax-H3 Motion Video Ref", category=CATEGORY,
-            description="動き・タイミング・カメラワークの参照。VIDEO か IMAGE（フレーム列）のどちらでも接続可",
+            description="動き・タイミング・カメラワークの参照。IMAGE（フレーム列）を受け、そのまま motion ピンに出力する",
             inputs=[
                 _enable(),
-                io.Video.Input("video", optional=True),
-                io.Image.Input("images", optional=True, tooltip="フレーム列。video が未接続のときに使用し VIDEO に変換する"),
-                io.Float.Input("fps", default=24.0, min=1.0, max=120.0, step=0.5, tooltip="images 入力時のフレームレート"),
+                io.Image.Input("images", optional=True, tooltip="参照動画のフレーム列（24fps・2〜15秒）"),
+                io.Video.Input("video", optional=True, tooltip="images が未接続のときに使用（フレーム列に変換して出力）"),
                 io.String.Input("motion_video_desc", multiline=True, default="", placeholder="【参照動画の動き】"),
                 io.Boolean.Input("auto_append_video_ref", default=True, tooltip="各Shotに <Video N> への参照を自動付与"),
                 io.Boolean.Input("replace_appearance", default=True,
@@ -274,13 +265,13 @@ class MinimaxH3MotionRef(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, enable, fps, motion_video_desc, auto_append_video_ref, replace_appearance,
-                video=None, images=None):
+    def execute(cls, enable, motion_video_desc, auto_append_video_ref, replace_appearance,
+                images=None, video=None):
         if not enable:
             return _off("motion")
-        if video is None and images is not None:
-            video = _images_to_video(images, fps)
-        return io.NodeOutput(Ref("motion", videos=[video] if video is not None else [], desc=motion_video_desc,
+        if images is None and video is not None:
+            images = _frames_from_video(video)
+        return io.NodeOutput(Ref("motion", videos=[images] if images is not None else [], desc=motion_video_desc,
                                  opts=dict(auto_append_video_ref=auto_append_video_ref,
                                            replace_appearance=replace_appearance)), True)
 
@@ -312,19 +303,21 @@ class MinimaxH3AudioRef(io.ComfyNode):
 
 
 # ---------------------------------------------------------------- bundle
+_PIN_OUT = {"image": io.Image.Output, "audio": io.Audio.Output}
+
+
 class MinimaxH3RefBundle(io.ComfyNode):
     @classmethod
     def define_schema(cls):
         return io.Schema(
             node_id="MinimaxH3RefBundle", display_name="MiniMax-H3 Ref Bundle", category=CATEGORY,
-            description="参照を kind 順に採番。picture/video/audio 出力を番号順に本家 Ref2V ノードへ接続する",
+            description="参照を集めて採番。出力ピンは参照の種類ごとに固定（他の参照を OFF にしても動かない）。"
+                        "本家 Ref2V ノードには画像ピンを上から順に接続する",
             inputs=[H3_REF.Input(f"ref{i}", optional=True) for i in range(1, MAX_REF_PINS + 1)],
             outputs=[
                 H3_BUNDLE.Output("bundle"),
-                io.String.Output("status", tooltip="採番結果・エラー・警告"),
-                *[io.Image.Output(f"picture_{i}") for i in range(1, MAX_IMAGES + 1)],
-                *[io.Video.Output(f"video_{i}") for i in range(1, MAX_VIDEOS + 1)],
-                *[io.Audio.Output(f"audio_{i}") for i in range(1, MAX_AUDIOS + 1)],
+                io.String.Output("status", tooltip="ピン名→<Picture N> の対応・エラー・警告"),
+                *[_PIN_OUT[t](name) for name, t in pin_layout()],
             ],
         )
 
@@ -338,12 +331,7 @@ class MinimaxH3RefBundle(io.ComfyNode):
             status = "WARN: " + " / ".join(b.warnings) + " | " + status
         else:
             status = "OK " + status
-
-        def pad(lst, n):
-            return (list(lst) + [None] * n)[:n]
-
-        return io.NodeOutput(b, status, *pad(b.pictures, MAX_IMAGES),
-                             *pad(b.videos, MAX_VIDEOS), *pad(b.audios, MAX_AUDIOS))
+        return io.NodeOutput(b, status, *[b.pin_media.get(name) for name, _ in pin_layout()])
 
 
 # ---------------------------------------------------------------- prompt generator

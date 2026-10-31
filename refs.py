@@ -19,13 +19,13 @@ except ImportError:
     from common import (MAX_SHOTS, POSSESSIVE, collect_from_kwargs, dialogue_lines_only, resolve_music,
                         clean_prompt, normalize_tags, normalize_and_strip_shot)
 
-KIND_ORDER = ("character", "anchor", "male", "costume", "stage")
+KIND_ORDER = ("character", "anchor", "male", "costume", "stage", "scene")
 ALL_KINDS = KIND_ORDER + ("motion", "audio")
 MAX_IMAGES, MAX_VIDEOS, MAX_AUDIOS = 9, 3, 3
 
 # Bundle の出力ピン。名前は Ref ノードの種類と一致させ、他の参照の ON/OFF で中身が動かない。
 # 画像の並びは採番順（character → anchor → male → costume → stage）と同じ。
-PIN_SLOTS = {"character": 2, "anchor": 1, "male": 2, "costume": 2, "stage": 2, "motion": 3, "audio": 3}
+PIN_SLOTS = {"character": 2, "anchor": 1, "male": 2, "costume": 2, "stage": 2, "scene": 1, "motion": 3, "audio": 3}
 
 
 def pin_name(kind, idx):
@@ -40,17 +40,21 @@ def pin_layout():
     return out
 
 
-DEFAULT_MALE_ROLE = "male POV hands"
-DEFAULT_MALE_RETENTION = "partially_preserved - hands interacting naturally with <Subject 1>"
-
-# 音声の役割ごとの文言。公式 ref-en.txt の書式に合わせて必要なら編集してください。
+# 音声の役割ごとの文言（公式 ref-en.txt 4.2 に準拠）。{a} は <Audio N>。
 AUDIO_ROLES = ["reference", "fully_copy", "partially_copy", "weak_reference"]
-AUDIO_ROLE_TEXT = {
-    "fully_copy": "the voice, speech content, and timing of {a} are reproduced as is",
-    "partially_copy": "the main voice and speech content of {a} are reproduced, with minor adaptation to the scene",
-    "reference": "only the vocal timbre, rhythm, and speaking style of {a} are referenced",
-    "weak_reference": "the vocal character of {a} is loosely referenced",
+AUDIO_DEF = {
+    "reference": "{a} is the voice-timbre reference for <Subject 1> (S1)",
+    "fully_copy": "{a} is the audio track reused as the voice of <Subject 1> (S1)",
+    "partially_copy": "{a} is the audio track partly reused for <Subject 1> (S1)",
+    "weak_reference": "{a} is a loose voice reference for <Subject 1> (S1)",
 }
+AUDIO_RET = {
+    "fully_copy": "{a} is reused 1:1 as the target video's complete final audio track.",
+    "partially_copy": "only part of {a} is copied, and other sounds may be added, removed, or replaced after copying.",
+    "reference": "the target speaker follows {a}'s voice timbre and measured delivery without copying the original signal.",
+    "weak_reference": "only a broad similarity in the vocal category or atmosphere of {a} is retained.",
+}
+SCENE_STRENGTHS = ["partially_preserved", "weak_reference"]
 
 
 @dataclass
@@ -71,6 +75,7 @@ class Ref:
     vids: list = field(default_factory=list)
     auds: list = field(default_factory=list)
     subj: int = 0
+    sub: dict = field(default_factory=dict)   # scene: {'pose': n, 'scene': n}
 
 
 @dataclass
@@ -123,7 +128,7 @@ def bundle_refs(refs):
     has_char = any(r.kind == "character" for r in ordered)
     n_subj = 0
     for r in ordered:
-        r = replace(r, pics=[], vids=[], auds=[], subj=0)
+        r = replace(r, pics=[], vids=[], auds=[], subj=0, sub={})
         for im in r.images:
             b.pictures.append(im)
             r.pics.append(len(b.pictures))
@@ -136,16 +141,21 @@ def bundle_refs(refs):
             b.audios.append(a)
             r.auds.append(len(b.audios))
             _pin(b, r.kind, "Audio", len(b.audios), a)
-        if r.kind in ("character", "male") or (r.kind == "anchor" and not has_char):
+        if r.kind in ("character", "male", "costume", "stage") or (r.kind == "anchor" and not has_char):
             n_subj += 1
             r.subj = n_subj
+        elif r.kind == "scene":   # scene は pose / scene の2つの Subject を持てる
+            for key, opt in (("pose", "inherit_pose"), ("scene", "inherit_scene")):
+                if r.opts.get(opt, True):
+                    n_subj += 1
+                    r.sub[key] = n_subj
         b.refs.append(r)
 
     # ---- validation
     cnt = lambda k: len(b.of(k))  # noqa: E731
     if cnt("anchor") > 1:
         b.errors.append("anchor（先頭/末尾フレーム）は1つまで")
-    need = {"character": "pics", "anchor": "pics", "costume": "pics", "stage": "pics",
+    need = {"character": "pics", "anchor": "pics", "costume": "pics", "stage": "pics", "scene": "pics",
             "motion": "vids", "audio": "auds"}
     for r in b.refs:
         if r.kind in need and not getattr(r, need[r.kind]):
@@ -158,13 +168,15 @@ def bundle_refs(refs):
         b.errors.append(f"音声が上限超過 ({len(b.audios)}/{MAX_AUDIOS})")
 
     has_s1 = any(r.subj == 1 and r.kind in ("character", "anchor") for r in b.refs)
-    dependents = [k for k in ("male", "costume", "audio") if cnt(k)]
+    dependents = [k for k in ("male", "costume", "scene", "audio") if cnt(k)]
     if dependents and not has_s1:
         b.errors.append(f"{' / '.join(dependents)} には character か anchor（最初の参照画像）が必要")
     elif not has_s1:
         b.warnings.append("character / anchor が無いため <Subject 1> は定義されません")
     if cnt("audio") and not (b.pictures or b.videos):
         b.errors.append("音声には視覚アンカー（画像か動画）が必要")
+    if cnt("scene") and cnt("anchor"):
+        b.warnings.append("anchor と scene の両方が構図を指定しています")
     if cnt("costume") and cnt("anchor"):
         b.warnings.append("anchor 画像の服装と costume が競合する可能性")
     return b
@@ -182,7 +194,15 @@ def _tags(prefix, nums):
 
 def _x(text):
     t = normalize_tags((text or "").strip())
+    if t and t[-1] not in ".!?。！？":
+        t += "."
     return f" {t}" if t else ""
+
+
+def _with(word, text):
+    """説明文を名詞句として ', with ...' / ', featuring ...' の形で挿入する（空なら空文字）。"""
+    t = normalize_tags((text or "").strip()).rstrip(".!?。！？ ")
+    return f", {word} {t}" if t else ""
 
 
 def _shots(r, names, shot_map, warns):
@@ -201,20 +221,23 @@ def _lab(names, nums):
 
 
 def render_sections(b, names, shot_map, subject_type, action, texts):
-    """戻り値: ({'defs','summary','rets'}, warnings)"""
+    """戻り値: ({'defs','summary','rets'}, warnings)。書式は公式 ref-en ガイドに準拠。"""
     warns = []
     poss = POSSESSIVE.get(subject_type, "their")
     chars, males, costumes = b.of("character"), b.of("male"), b.of("costume")
-    stages, motions, audios = b.of("stage"), b.of("motion"), b.of("audio")
+    stages, scenes = b.of("stage"), b.of("scene")
+    motions, audios = b.of("motion"), b.of("audio")
     anchor = (b.of("anchor") or [None])[0]
     final = names[-1]
     all_lab = ", ".join(names)
-    has_s1 = any(r.subj == 1 for r in b.refs)
+    has_s1 = any(r.subj == 1 and r.kind in ("character", "anchor") for r in b.refs)
     atype = anchor.opts.get("anchor_type", "first") if anchor else None
     first = atype == "first"
     ap = _tags("Picture", anchor.pics) if anchor else ""
     cpic = _tags("Picture", chars[0].pics[:1]) if chars else ""
-    cos_tags = ", ".join(_tags("Picture", c.pics) for c in costumes)
+    cos_subj = ", ".join(f"<Subject {c.subj}>" for c in costumes)
+    vt_all = ", ".join(_tags("Video", v.vids) for v in motions)
+    move_line = f"The body movement and action rhythm of <Subject 1> come from {vt_all}." if motions else ""
     defs, rets = [], []
 
     # ---- character
@@ -222,11 +245,13 @@ def render_sections(b, names, shot_map, subject_type, action, texts):
         clothing = c.opts.get("include_clothing", True) and not costumes
         lock = "face, hair, " + ("clothing, " if clothing else "") + "skin tone, and body proportions"
         defs.append(f"<Subject {c.subj}> is the {subject_type} depicted in the character reference images "
-                    f"({_tags('Picture', c.pics)}, showing full-body and close-up face views), maintaining the "
-                    f"exact {lock} of the reference.{_x(c.desc)}")
+                    f"({_tags('Picture', c.pics)}, showing full-body and close-up face views){_with('with', c.desc)}, "
+                    f"maintaining the exact {lock} of the reference.")
         defs.append(f"The reference images provide the definitive character design sheet for <Subject {c.subj}>.")
+        if c.subj == 1 and move_line:
+            defs.append(move_line)
         lab = _lab(names, _shots(c, names, shot_map, warns))
-        tail = f" Clothing follows {cos_tags}." if costumes else ""
+        tail = f" Clothing follows {cos_subj}." if costumes else ""
         rets.append(f"<Subject {c.subj}> (appears in {lab}): {c.retention or 'fully_preserved'} - the exact {lock} "
                     "from the character reference images remain entirely consistent across all active shots; "
                     f"only expressions, poses, and movements change as described.{tail}")
@@ -237,6 +262,8 @@ def render_sections(b, names, shot_map, subject_type, action, texts):
             clothing = "" if costumes else "the exact clothing, "
             defs.append(f"<Subject 1> is the {subject_type} in {ap}, with the exact face, the exact hair, "
                         f"{clothing}skin tone, and body proportions of {ap}.{_x(anchor.desc)}")
+            if move_line:
+                defs.append(move_line)
         who = f"<Subject 1> (the same person as defined in {cpic})" if chars else "<Subject 1>"
         if first:
             defs.append(f"{ap} is the first frame of [Shot 1], showing {who} in the exact pose, framing, and "
@@ -257,20 +284,21 @@ def render_sections(b, names, shot_map, subject_type, action, texts):
         rets.append(f"{ap} ({where}): fully_preserved - the target video {'opens on' if first else 'ends on'} "
                     f"the exact {what} of {ap}{excl}.")
 
-    # ---- male
+    # ---- male（既定は通常の男性。POV の手だけを出したい場合は pov_hands）
     for m in males:
-        role = m.role.strip() or DEFAULT_MALE_ROLE
+        pov = m.opts.get("pov_hands", False)
+        role = m.role.strip() or ("male POV hands" if pov else "man")
+        pt = _tags("Picture", m.pics)
         if m.pics:
-            defs.append(f"<Subject {m.subj}> is the {role} in {_tags('Picture', m.pics)}.{_x(m.desc)}")
-            default_ret = (f"partially_preserved - the appearance of <Subject {m.subj}> from "
-                           f"{_tags('Picture', m.pics)} is retained, interacting naturally with <Subject 1>")
-        elif anchor:
+            defs.append(f"<Subject {m.subj}> is the {role} in {pt}{_with('with', m.desc)}.")
+            default_ret = (f"partially_preserved - the hands from {pt} are retained, interacting naturally with <Subject 1>"
+                           if pov else f"fully_preserved - the {role}'s face, hair, clothing, and build from {pt} are "
+                                       "retained, interacting naturally with <Subject 1>")
+        else:
             intro = "(or introduced from the image)" if first else "(or introduced earlier)"
             defs.append(f"<Subject {m.subj}> is the {role} visible in {ap} {intro}.{_x(m.desc)}")
-            default_ret = DEFAULT_MALE_RETENTION
-        else:
-            defs.append(f"<Subject {m.subj}> is the {role}.{_x(m.desc)}")
-            default_ret = DEFAULT_MALE_RETENTION
+            default_ret = ("partially_preserved - hands interacting naturally with <Subject 1>" if pov else
+                           f"partially_preserved - the {role}'s appearance follows {ap}, interacting naturally with <Subject 1>")
         nums = _shots(m, names, shot_map, warns)
         rets.append(f"<Subject {m.subj}> (appears in {_lab(names, nums)}): "
                     f"{normalize_tags(m.retention.strip()) or default_ret}")
@@ -278,55 +306,81 @@ def render_sections(b, names, shot_map, subject_type, action, texts):
             if n - 1 < len(texts) and f"<Subject {m.subj}>" not in texts[n - 1]:
                 warns.append(f"{names[n - 1]} の本文に <Subject {m.subj}> が見当たりません")
 
-    # ---- costume（対象は常に最初の参照画像 = <Picture 1> / <Subject 1>）
+    # ---- costume（Subject として定義し、最初の参照画像の人物 = <Subject 1> へ attribute_transfer）
     for c in costumes:
         parts = c.opts.get("parts", "whole outfit")
         what = "outfit" if parts == "whole outfit" else parts
         t = _tags("Picture", c.pics)
-        defs.append(f"<Subject 1> wears the {what} shown in {t}, replacing the clothing of <Picture 1>; the face, "
-                    f"hair, skin tone, and body proportions remain those of <Picture 1>.{_x(c.desc)}")
-        rets.append(f"{t} (clothing of <Subject 1>): {c.retention or 'attribute_transfer'} - clothing only "
-                    f"({what}); face, hair, and body are not taken from it.")
+        defs.append(f"<Subject {c.subj}> is the {what} in {t}{_with('featuring', c.desc)}.")
+        rets.append(f"<Subject {c.subj}> (appears in {all_lab}): {c.retention or 'attribute_transfer'} - the {what} "
+                    f"is transferred onto <Subject 1>; the wearer's face, hair, and body in {t} are not retained.")
 
-    # ---- stage
-    for s in stages:
-        t = _tags("Picture", s.pics)
-        defs.append(f"{t} is the stage reference: use only the environment, lighting, layout, and atmosphere "
-                    f"of {t}; ignore any people in it.{_x(s.desc)}")
-        lab = _lab(names, _shots(s, names, shot_map, warns))
-        rets.append(f"{t} (environment, used in {lab}): {s.retention or 'partially_preserved'} - the setting, "
-                    "layout, lighting, and atmosphere are retained; no subject identity is taken from it.")
+    # ---- stage（環境は Subject）
+    for st in stages:
+        t = _tags("Picture", st.pics)
+        defs.append(f"<Subject {st.subj}> is the environment in {t}{_with('featuring', st.desc)}. "
+                    f"Any people in {t} are not part of this subject.")
+        lab = _lab(names, _shots(st, names, shot_map, warns))
+        rets.append(f"<Subject {st.subj}> (appears in {lab}): {st.retention or 'partially_preserved'} - the "
+                    "setting, layout, lighting, and atmosphere are retained.")
 
-    # ---- motion video
+    # ---- scene composition（ストーリーボード参照。キーフレームではない）
+    for sc in scenes:
+        t = _tags("Picture", sc.pics)
+        lab = _lab(names, _shots(sc, names, shot_map, warns))
+        pose_n, env_n = sc.sub.get("pose"), sc.sub.get("scene")
+        place = sc.opts.get("placement", "")
+        planning = "viewpoint, camera angle, framing, " + ("subject placement, and pose" if pose_n else "and subject placement")
+        strength = sc.retention or "partially_preserved"
+        defs.append(f"{t} is a storyboard reference for {lab}, defining its {planning}; the person shown in {t} "
+                    f"is replaced by <Subject 1>.{_x(place)}{_x(sc.desc)}")
+        if pose_n:
+            defs.append(f"<Subject {pose_n}> is the pose and body posture of the person in {t}.")
+        if env_n:
+            defs.append(f"<Subject {env_n}> is the environment, lighting, and art style of {t}, excluding the person.")
+        rets.append(f"{t} (storyboard reference for {lab}): {strength} - only the composition, camera angle, and "
+                    "subject placement are followed; it is not a first or last frame, and the video does not need "
+                    "to land on it.")
+        if pose_n:
+            rets.append(f"<Subject {pose_n}> (appears in {lab}): attribute_transfer - the pose and body placement "
+                        f"are transferred onto <Subject 1>; the person's identity, face, hair, and clothing from "
+                        f"{t} are not retained.")
+        if env_n:
+            rets.append(f"<Subject {env_n}> (appears in {lab}): {strength} - the setting, lighting, and art style "
+                        "are retained; the person is not.")
+
+    # ---- motion video（カメラ・間・アクションの時間構造）
     for v in motions:
         t = _tags("Video", v.vids)
         swap = has_s1 and v.opts.get("replace_appearance", True)
-        defs.append(f"{t} is the motion reference video that provides the body movement, timing, camera "
-                    f"movement, and action rhythm to be followed by <Subject 1>.{_x(v.desc)}"
+        defs.append(f"{t} is the reference video for the camera movement, cuts, pacing, and action timing of the "
+                    f"target video.{_x(v.desc)}"
                     + (f" The face, hair, clothing, and body of any person in {t} are not used." if swap else ""))
-        rets.append(f"{t} (motion, timing, and camera structure): partially_preserved - the body movements, "
-                    "action timing, and overall rhythm are followed as closely as possible, while "
+        rets.append(f"{t} (camera movement, pacing, and action structure): partially_preserved - the camera "
+                    "movement, action timing, and overall rhythm are followed as closely as possible, while "
                     + ("the original person's appearance is completely discarded from the very first frame and "
                        "replaced by <Subject 1>." if swap else "the character appearance is replaced by <Subject 1>."))
 
-    # ---- audio（話者は常に <Subject 1>）
+    # ---- audio（話者は <Subject 1> (S1)。retention に (Sx) は書かない）
     for a in audios:
         t = _tags("Audio", a.auds)
         role = a.opts.get("audio_role", "reference")
-        text = AUDIO_ROLE_TEXT.get(role, AUDIO_ROLE_TEXT["reference"]).format(a=t)
-        lip = "; the lip movements of <Subject 1> are synchronized to it" if a.opts.get("lipsync", True) else ""
-        defs.append(f"{t} is the voice of <Subject 1>.{_x(a.desc)}")
-        lab = _lab(names, _shots(a, names, shot_map, warns))
-        rets.append(f"{t} (voice of <Subject 1>, used in {lab}): {role} - {text}{lip}.")
+        lip = " The lip movements of <Subject 1> are synchronized to it." if a.opts.get("lipsync", True) else ""
+        defs.append(f"{AUDIO_DEF.get(role, AUDIO_DEF['reference']).format(a=t)}.{lip}{_x(a.desc)}")
+        scope = f" It applies to {_lab(names, _shots(a, names, shot_map, warns))}." if a.shots else ""
+        rets.append(f"{t}: {role} - {AUDIO_RET.get(role, AUDIO_RET['reference']).format(a=t)}{scope}")
 
-    # ---- summary
+    # ---- summary（タスク種別は公式の6種類のみ）
     tasks = []
-    if chars:
-        tasks.append("character consistency generation")
     if anchor:
         tasks.append("keyframe completion")
-    if males or costumes or stages or motions or audios:
+    if chars or males or costumes or stages or scenes or motions:
         tasks.append("reference generation")
+    roles = {a.opts.get("audio_role", "reference") for a in audios}
+    if roles & {"fully_copy", "partially_copy"}:
+        tasks.append("audio reuse")
+    if roles & {"reference", "weak_reference"}:
+        tasks.append("audio reference")
     tag = f"[{' + '.join(tasks)}]" if tasks else ""
     if has_s1:
         a_str = f" of <Subject 1> {action}" if action else " of <Subject 1>"
@@ -343,20 +397,22 @@ def render_sections(b, names, shot_map, subject_type, action, texts):
     extra = []
     if chars:
         extra.append("The appearance, facial features, and styling of <Subject 1> are strictly locked to the "
-                     f"character reference ({cpic})" + (f", except for the clothing, which follows {cos_tags}." if costumes else "."))
+                     f"character reference ({cpic})" + (f", except for the clothing, which follows {cos_subj}." if costumes else "."))
     if anchor and chars:
         extra.append(f"The {'initial' if first else 'final'} pose, framing, and composition are locked to {ap}.")
     elif anchor:
         extra.append(f"The appearance, pose, and framing of <Subject 1> at the {'beginning' if first else 'end'} "
                      f"are locked to {ap}.")
-    if stages:
-        extra.append(f"The environment, lighting, and layout follow {', '.join(_tags('Picture', s.pics) for s in stages)}.")
+    for st in stages:
+        extra.append(f"The environment follows <Subject {st.subj}>.")
+    for sc in scenes:
+        extra.append(f"The composition and camera angle follow {_tags('Picture', sc.pics)}, with <Subject 1> "
+                     "replacing the person in it.")
     if motions:
-        extra.append(f"The movements, timing, and camera work are guided by {', '.join(_tags('Video', v.vids) for v in motions)}.")
+        extra.append(f"The movements, timing, and camera work are guided by {vt_all}.")
     if motions and has_s1 and any(v.opts.get("replace_appearance", True) for v in motions):
-        extra.append("From the very first frame, <Subject 1> replaces the person in "
-                     f"{', '.join(_tags('Video', v.vids) for v in motions)}; the original person's appearance "
-                     "never appears in the target video.")
+        extra.append(f"From the very first frame, <Subject 1> replaces the person in {vt_all}; the original "
+                     "person's appearance never appears in the target video.")
     if audios:
         extra.append(f"The voice of <Subject 1> follows {', '.join(_tags('Audio', a.auds) for a in audios)}.")
     summary = " ".join([tag, body] + extra).strip()
@@ -417,7 +473,7 @@ def generate_from_bundle(b, summary_action, camera_style, soundscape, enable_mus
     sec, rw = render_sections(b, names, shot_map, subject_type, action, formatted)
     warns += rw + b.warnings
 
-    shots_content = "\n\n".join(formatted)
+    shots_content = "\n".join(formatted)
     camera = (camera_style or "").strip()
     camera_line = f"The target video is filmed in {camera}.\n" if camera else ""
     prompt = f"""subject_definitions:
@@ -450,3 +506,15 @@ def fit_size(w, h, megapixels, step=SIZE_STEP):
     scale = (megapixels * 1_000_000 / (w * h)) ** 0.5
     snap = lambda v: max(step, int(round(v * scale / step)) * step)  # noqa: E731
     return snap(w), snap(h)
+
+
+def describe_placement(x0, y0, x1, y1, W, H):
+    """マスクのバウンディングボックス → 人物の配置を表す英文。"""
+    cx, cy = (x0 + x1) / 2 / W, (y0 + y1) / 2 / H
+    hz = "left" if cx < 0.4 else "right" if cx > 0.6 else "center"
+    vt = "upper" if cy < 0.4 else "lower" if cy > 0.6 else "middle"
+    pos = "center" if (hz == "center" and vt == "middle") else (hz if vt == "middle" else vt if hz == "center" else f"{vt} {hz}")
+    where = (f"on the {pos} side of the frame" if pos in ("left", "right") else
+             f"in the {pos} part of the frame" if pos in ("upper", "lower") else f"in the {pos} of the frame")
+    return (f"The person is placed {where}, spanning about {round((y1 - y0) / H * 100)}% "
+            f"of its height and {round((x1 - x0) / W * 100)}% of its width.")

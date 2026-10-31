@@ -9,12 +9,12 @@ try:
     from . import refstore as store
     from .common import SUBJECT_TYPES, MAX_SHOTS, DEFAULT_DURATION, MIN_DURATION, MAX_SHOT_DURATION
     from .refs import (Ref, bundle_refs, describe, generate_from_bundle, AUDIO_ROLES,
-                       pin_layout, SIZE_STEP, fit_size)
+                       pin_layout, SIZE_STEP, fit_size, describe_placement, SCENE_STRENGTHS)
 except ImportError:
     import refstore as store
     from common import SUBJECT_TYPES, MAX_SHOTS, DEFAULT_DURATION, MIN_DURATION, MAX_SHOT_DURATION
     from refs import (Ref, bundle_refs, describe, generate_from_bundle, AUDIO_ROLES,
-                      pin_layout, SIZE_STEP, fit_size)
+                      pin_layout, SIZE_STEP, fit_size, describe_placement, SCENE_STRENGTHS)
 
 H3_REF = io.Custom("H3_REF")
 H3_BUNDLE = io.Custom("H3_BUNDLE")
@@ -35,8 +35,9 @@ def _image_override():
                           tooltip="接続した場合はプリセット画像の代わりにこの画像を使用")
 
 
-def _shot_flags(suffix, tooltip):
-    return [io.Boolean.Input(f"shot{i}_{suffix}", default=True, tooltip=tooltip) for i in range(1, MAX_SHOTS + 1)]
+def _shot_flags(suffix, tooltip, first_only=False):
+    return [io.Boolean.Input(f"shot{i}_{suffix}", default=(i == 1 or not first_only), tooltip=tooltip)
+            for i in range(1, MAX_SHOTS + 1)]
 
 
 def _pick_shots(kw, suffix):
@@ -121,7 +122,9 @@ class MinimaxH3MaleRef(io.ComfyNode):
             description="男性の参照画像。登場Shotを指定可能。画像なし＝アンカー画像に写っている男性",
             inputs=[
                 _enable(), _preset_input("males"), _image_override(),
-                io.String.Input("role", default="", placeholder="【男性の役割】例: male POV hands"),
+                io.Boolean.Input("pov_hands", default=False,
+                                 tooltip="ON: POV の手だけが映る男性として扱う（role が空のとき 'male POV hands'）。OFF: 通常の男性（'man'）"),
+                io.String.Input("role", default="", placeholder="【男性の役割】空なら man（例: man / male POV hands）"),
                 io.String.Input("retention_desc", default="", placeholder="【保持設定】（空なら自動）"),
                 io.String.Input("extra", multiline=True, default="", placeholder="【外見の補足】"),
                 *_shot_flags("appears", "このShotに登場"),
@@ -134,14 +137,14 @@ class MinimaxH3MaleRef(io.ComfyNode):
         return store.fingerprint("males", kw.get("preset"))
 
     @classmethod
-    def execute(cls, enable, preset, role, retention_desc, extra, image=None, **kw):
+    def execute(cls, enable, preset, pov_hands, role, retention_desc, extra, image=None, **kw):
         if not enable:
             return _off("male")
         d = store.load_preset("males", preset)
         return io.NodeOutput(Ref("male", images=_images(image, d), name=d["name"],
                                  role=role.strip() or d["role"], desc=_join(d["desc"], extra),
                                  retention=retention_desc.strip() or d["retention"],
-                                 shots=_pick_shots(kw, "appears")), True)
+                                 shots=_pick_shots(kw, "appears"), opts=dict(pov_hands=pov_hands)), True)
 
 
 class MinimaxH3StageRef(io.ComfyNode):
@@ -239,6 +242,72 @@ class MinimaxH3AnchorRef(io.ComfyNode):
         ref = Ref("anchor", images=[image[i:i + 1] for i in range(image.shape[0])],
                   desc=extra, opts=dict(anchor_type=anchor_type))
         return io.NodeOutput(ref, True, image, w, h)
+
+
+def _mask_scene(image, mask, mode):
+    """人物マスク（白=人物）から配置の英文を作り、mode に応じて人物領域を塗りつぶす/ぼかす。"""
+    import torch
+    import torch.nn.functional as F
+    B, H, W, C = image.shape
+    m = mask.float()
+    if m.dim() == 2:
+        m = m.unsqueeze(0)
+    if tuple(m.shape[1:]) != (H, W):
+        m = F.interpolate(m.unsqueeze(1), size=(H, W), mode="nearest-exact").squeeze(1)
+    m = (m[:1] > 0.5).float()                      # [1,H,W]
+    placement = ""
+    ys, xs = torch.nonzero(m[0], as_tuple=True)
+    if ys.numel():
+        placement = describe_placement(int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1, W, H)
+    if mode == "none":
+        return image, placement
+    mm = m.unsqueeze(-1)                           # [1,H,W,1]
+    if mode == "gray_fill":
+        fill = torch.full_like(image, 0.5)
+    else:                                          # blur
+        k = max(3, (min(H, W) // 16) | 1)
+        x = F.pad(image.movedim(-1, 1), (k // 2,) * 4, mode="replicate")
+        fill = F.avg_pool2d(x, k, stride=1).movedim(1, -1)
+    return image * (1 - mm) + fill * mm, placement
+
+
+class MinimaxH3SceneRef(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="MinimaxH3SceneRef", display_name="MiniMax-H3 Scene Composition Ref", category=CATEGORY,
+            description="場面イラストの構図・ポーズ・画風を継承し、人物だけを <Subject 1>（Character Ref）に差し替える。"
+                        "キーフレームではなくストーリーボード参照として扱うため、その画像に着地しない",
+            inputs=[
+                _enable(),
+                io.Image.Input("image", optional=True, tooltip="構図・ポーズ・画風・背景・照明・カメラアングルを継承したい場面イラスト"),
+                io.Mask.Input("mask", optional=True,
+                              tooltip="人物部分のマスク（白=人物。背景ではなく人物を指定）。配置の説明文の自動生成と、人物領域の加工に使う"),
+                io.Combo.Input("mask_mode", options=["none", "gray_fill", "blur"], default="none",
+                               tooltip="none: 画像はそのまま（配置の文章だけ生成） / gray_fill: 人物領域を灰色で塗る / "
+                                       "blur: 人物領域をぼかす（元の人物の顔・服が参照画像から漏れるのを抑える）"),
+                io.Boolean.Input("inherit_pose", default=True, tooltip="人物のポーズ・姿勢を <Subject 1> に移す"),
+                io.Boolean.Input("inherit_scene", default=True, tooltip="背景・照明・画風を継承する"),
+                io.Combo.Input("strength", options=SCENE_STRENGTHS, default="partially_preserved",
+                               tooltip="partially_preserved: 構図とポーズをできるだけ維持 / weak_reference: 大まかな雰囲気だけ"),
+                io.String.Input("extra", multiline=True, default="", placeholder="【場面の補足（任意）】"),
+                *_shot_flags("applies", "この Shot で構図を参照する（既定は Shot 1 のみ）", first_only=True),
+            ],
+            outputs=_outs(io.Image.Output("image")),
+        )
+
+    @classmethod
+    def execute(cls, enable, mask_mode, inherit_pose, inherit_scene, strength, extra,
+                image=None, mask=None, **kw):
+        if not enable:
+            return _off("scene", image)
+        out, placement = image, ""
+        if image is not None and mask is not None:
+            out, placement = _mask_scene(image, mask, mask_mode)
+        ref = Ref("scene", images=[out[:1]] if out is not None else [], desc=extra, retention=strength,
+                  shots=_pick_shots(kw, "applies"),
+                  opts=dict(inherit_pose=inherit_pose, inherit_scene=inherit_scene, placement=placement))
+        return io.NodeOutput(ref, True, out)
 
 
 def _frames_from_video(video):
@@ -371,6 +440,6 @@ class MinimaxH3RefPromptGenerator(io.ComfyNode):
 
 NODES = [
     MinimaxH3CharacterRef, MinimaxH3MaleRef, MinimaxH3StageRef, MinimaxH3CostumeRef,
-    MinimaxH3AnchorRef, MinimaxH3MotionRef, MinimaxH3AudioRef,
+    MinimaxH3AnchorRef, MinimaxH3SceneRef, MinimaxH3MotionRef, MinimaxH3AudioRef,
     MinimaxH3RefBundle, MinimaxH3RefPromptGenerator,
 ]

@@ -264,10 +264,11 @@ def _mask_scene(image, mask, mode):
     mm = m.unsqueeze(-1)                           # [1,H,W,1]
     if mode == "gray_fill":
         fill = torch.full_like(image, 0.5)
-    else:                                          # blur
-        k = max(3, (min(H, W) // 16) | 1)
-        x = F.pad(image.movedim(-1, 1), (k // 2,) * 4, mode="replicate")
-        fill = F.avg_pool2d(x, k, stride=1).movedim(1, -1)
+    else:                                          # blur: 縮小→拡大（計算量は画素数に比例。大きな箱型ぼかしは CPU で極端に遅い）
+        f = max(4, min(H, W) // 32)
+        x = image.movedim(-1, 1)                   # [B,C,H,W]
+        small = F.interpolate(x, size=(max(1, H // f), max(1, W // f)), mode="area")
+        fill = F.interpolate(small, size=(H, W), mode="bilinear", align_corners=False).movedim(1, -1)
     return image * (1 - mm) + fill * mm, placement
 
 
@@ -285,7 +286,7 @@ class MinimaxH3SceneRef(io.ComfyNode):
                               tooltip="人物部分のマスク（白=人物。背景ではなく人物を指定）。配置の説明文の自動生成と、人物領域の加工に使う"),
                 io.Combo.Input("mask_mode", options=["none", "gray_fill", "blur"], default="none",
                                tooltip="none: 画像はそのまま（配置の文章だけ生成） / gray_fill: 人物領域を灰色で塗る / "
-                                       "blur: 人物領域をぼかす（元の人物の顔・服が参照画像から漏れるのを抑える）"),
+                                       "blur: 人物領域を強くぼかす（縮小→拡大方式。元の人物の顔・服が参照画像から漏れるのを抑える）"),
                 io.Boolean.Input("inherit_pose", default=True, tooltip="人物のポーズ・姿勢を <Subject 1> に移す"),
                 io.Boolean.Input("inherit_scene", default=True, tooltip="背景・照明・画風を継承する"),
                 io.Combo.Input("strength", options=SCENE_STRENGTHS, default="partially_preserved",
